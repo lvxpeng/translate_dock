@@ -1,0 +1,31 @@
+[package]
+name = "translate_dock"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = { version = "0.33.3", features = ["default_fonts"] }
+reqwest = { version = "0.12", features = ["json"] }
+tokio = { version = "1.37", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+log = "0.4"
+env_logger = "0.11"
+tray-icon = "0.21.3"
+image = { version = "0.25", default-features = false, features = ["ico", "png"] }
+
+[build-dependencies]
+winres = "0.1"
+
+# Release 配置（生产）
+[profile.release]
+opt-level = 3          # 最大优化
+debug = false
+# split-debuginfo = "..."
+debug-assertions = false
+overflow-checks = false
+lto = true             # 链接时优化
+panic = 'abort'        # 崩溃时直接退出
+incremental = false
+strip = true
+codegen-units = 1
