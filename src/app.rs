@@ -4,10 +4,24 @@ use crate::translate::{translate_text, Language};
 use tray_icon::{TrayIcon, TrayIconBuilder, Icon, TrayIconEvent, MouseButton, MouseButtonState};
 use tray_icon::menu::{Menu, MenuItem, MenuEvent, MenuId};
 
+#[cfg(windows)]
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    ShowWindow, SetForegroundWindow, GetSystemMetrics,
+    SW_MINIMIZE, SW_RESTORE,
+    SM_CXSCREEN, SM_CYSCREEN,
+    SPI_GETWORKAREA, SystemParametersInfoW,
+};
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{HWND, RECT};
+
 // ── 配置持久化 ──────────────────────────────────────────────
 
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 struct AppConfig {
+    /// 加密后的 API Key（base64 编码）
+    #[serde(default)]
+    encrypted_api_key: String,
+    /// 旧版明文字段，仅用于迁移兼容
     #[serde(default)]
     api_key: String,
 }
@@ -23,20 +37,218 @@ fn config_path() -> std::path::PathBuf {
     dir.join("config.json")
 }
 
-fn load_config() -> AppConfig {
-    let path = config_path();
-    std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+// ── DPAPI 加解密 ──────────────────────────────────────────
+
+#[cfg(windows)]
+fn dpapi_encrypt(plaintext: &str) -> Option<String> {
+    use base64::Engine;
+    use windows_sys::Win32::Security::Cryptography::{
+        CryptProtectData, CRYPT_INTEGER_BLOB,
+    };
+
+    if plaintext.is_empty() {
+        return Some(String::new());
+    }
+
+    let mut input_bytes = plaintext.as_bytes().to_vec();
+    let input_blob = CRYPT_INTEGER_BLOB {
+        cbData: input_bytes.len() as u32,
+        pbData: input_bytes.as_mut_ptr(),
+    };
+    let mut output_blob = CRYPT_INTEGER_BLOB {
+        cbData: 0,
+        pbData: std::ptr::null_mut(),
+    };
+
+    let result = unsafe {
+        CryptProtectData(
+            &input_blob,
+            std::ptr::null(),    // description
+            std::ptr::null(),    // optional entropy
+            std::ptr::null(),    // reserved
+            std::ptr::null(),    // prompt struct
+            0,                   // flags
+            &mut output_blob,
+        )
+    };
+
+    if result == 0 {
+        return None;
+    }
+
+    let encrypted = unsafe {
+        std::slice::from_raw_parts(output_blob.pbData, output_blob.cbData as usize).to_vec()
+    };
+
+    // 释放系统分配的内存
+    unsafe {
+        windows_sys::Win32::Foundation::LocalFree(output_blob.pbData as *mut _);
+    }
+
+    Some(base64::engine::general_purpose::STANDARD.encode(&encrypted))
 }
 
-fn save_config(config: &AppConfig) {
+#[cfg(windows)]
+fn dpapi_decrypt(encrypted_b64: &str) -> Option<String> {
+    use base64::Engine;
+    use windows_sys::Win32::Security::Cryptography::{
+        CryptUnprotectData, CRYPT_INTEGER_BLOB,
+    };
+
+    if encrypted_b64.is_empty() {
+        return Some(String::new());
+    }
+
+    let mut encrypted = base64::engine::general_purpose::STANDARD
+        .decode(encrypted_b64)
+        .ok()?;
+
+    let input_blob = CRYPT_INTEGER_BLOB {
+        cbData: encrypted.len() as u32,
+        pbData: encrypted.as_mut_ptr(),
+    };
+    let mut output_blob = CRYPT_INTEGER_BLOB {
+        cbData: 0,
+        pbData: std::ptr::null_mut(),
+    };
+
+    let result = unsafe {
+        CryptUnprotectData(
+            &input_blob,
+            std::ptr::null_mut(), // description
+            std::ptr::null(),     // optional entropy
+            std::ptr::null(),     // reserved
+            std::ptr::null(),     // prompt struct
+            0,                    // flags
+            &mut output_blob,
+        )
+    };
+
+    if result == 0 {
+        return None;
+    }
+
+    let decrypted = unsafe {
+        std::slice::from_raw_parts(output_blob.pbData, output_blob.cbData as usize).to_vec()
+    };
+
+    unsafe {
+        windows_sys::Win32::Foundation::LocalFree(output_blob.pbData as *mut _);
+    }
+
+    String::from_utf8(decrypted).ok()
+}
+
+#[cfg(not(windows))]
+fn dpapi_encrypt(plaintext: &str) -> Option<String> {
+    Some(plaintext.to_string())
+}
+
+#[cfg(not(windows))]
+fn dpapi_decrypt(encrypted: &str) -> Option<String> {
+    Some(encrypted.to_string())
+}
+
+fn load_config() -> (AppConfig, String) {
     let path = config_path();
-    if let Ok(json) = serde_json::to_string_pretty(config) {
+    let config: AppConfig = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+
+    // 优先从加密字段解密
+    if !config.encrypted_api_key.is_empty() {
+        let key = dpapi_decrypt(&config.encrypted_api_key).unwrap_or_default();
+        return (config, key);
+    }
+
+    // 兼容旧版明文字段：自动迁移
+    if !config.api_key.is_empty() {
+        let key = config.api_key.clone();
+        // 立即迁移为加密存储
+        save_config_key(&key);
+        return (config, key);
+    }
+
+    (config, String::new())
+}
+
+fn save_config_key(api_key: &str) {
+    let encrypted = dpapi_encrypt(api_key).unwrap_or_default();
+    let config = AppConfig {
+        encrypted_api_key: encrypted,
+        api_key: String::new(), // 清空明文字段
+    };
+    let path = config_path();
+    if let Ok(json) = serde_json::to_string_pretty(&config) {
         let _ = std::fs::write(path, json);
     }
 }
+
+// ── 获取屏幕工作区大小（排除任务栏） ───────────────────
+
+#[cfg(windows)]
+fn get_work_area() -> (f32, f32, f32, f32) {
+    // 返回 (x, y, width, height) 工作区域（排除任务栏）
+    let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+    let success = unsafe {
+        SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            &mut rect as *mut RECT as *mut _,
+            0,
+        )
+    };
+    if success != 0 {
+        (
+            rect.left as f32,
+            rect.top as f32,
+            (rect.right - rect.left) as f32,
+            (rect.bottom - rect.top) as f32,
+        )
+    } else {
+        // 回退：使用全屏大小
+        let w = unsafe { GetSystemMetrics(SM_CXSCREEN) } as f32;
+        let h = unsafe { GetSystemMetrics(SM_CYSCREEN) } as f32;
+        (0.0, 0.0, w, h)
+    }
+}
+
+#[cfg(not(windows))]
+fn get_work_area() -> (f32, f32, f32, f32) {
+    (0.0, 0.0, 1920.0, 1040.0)
+}
+
+/// 计算窗口初始位置：右下角，紧贴任务栏上边缘，右侧留一小段距离
+pub fn calculate_initial_position(window_width: f32, window_height: f32) -> egui::Pos2 {
+    let (wa_x, wa_y, wa_w, wa_h) = get_work_area();
+
+    // outer_margin 是 egui Frame 的外边距，窗口实际内容会有这个偏移
+    let margin = 16.0;
+    let right_gap = 12.0; // 右侧留出的小距离
+
+    let x = wa_x + wa_w - window_width - right_gap;
+    let y = wa_y + wa_h - window_height - margin;
+
+    egui::pos2(x, y)
+}
+
+// ── Win32 窗口操作 ─────────────────────────────────────────
+
+#[cfg(windows)]
+fn hide_window(hwnd: HWND) {
+    unsafe { ShowWindow(hwnd, SW_MINIMIZE); }
+}
+
+#[cfg(windows)]
+fn show_window(hwnd: HWND) {
+    unsafe {
+        ShowWindow(hwnd, SW_RESTORE);
+        SetForegroundWindow(hwnd);
+    }
+}
+
+// ── 应用事件 ───────────────────────────────────────────────
 
 enum AppEvent {
     Tray(TrayIconEvent),
@@ -57,11 +269,14 @@ pub struct TranslateApp {
     api_key_visible: bool,
 
     _tray_icon: TrayIcon,
-    /// 逻辑上是否「可见」（true = 在屏幕上，false = 移出屏幕外）
+    /// 逻辑上是否「可见」
     show_window: bool,
-    /// 窗口在屏幕上时的位置，用于隐藏后恢复
-    window_pos: egui::Pos2,
     is_pinned: bool,
+    /// 缓存的窗口句柄
+    #[cfg(windows)]
+    hwnd: Option<HWND>,
+    /// 固定的窗口位置（每次显示都恢复到此位置）
+    fixed_pos: egui::Pos2,
 
     app_rx: Receiver<AppEvent>,
     quit_id: MenuId,
@@ -80,7 +295,7 @@ fn load_icon() -> Icon {
 fn setup_custom_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     
-    // 尝试加载系统默认中文字体（微软雅黑）
+    // 使用 include_bytes! 嵌入微软雅黑字体
     fonts.font_data.insert(
         "msyh".to_owned(),
         egui::FontData::from_static(include_bytes!("C:\\Windows\\Fonts\\msyh.ttc")).into(),
@@ -160,7 +375,12 @@ impl TranslateApp {
         cc.egui_ctx.set_visuals(visuals);
 
         // 启动时从配置文件加载持久化数据
-        let config = load_config();
+        let (_config, api_key) = load_config();
+
+        // 计算固定位置
+        let window_width = 432.0 + 32.0;  // inner_size + outer_margin * 2
+        let window_height = 332.0 + 32.0;
+        let fixed_pos = calculate_initial_position(window_width, window_height);
 
         Self {
             input_text: String::new(),
@@ -168,16 +388,17 @@ impl TranslateApp {
             source_lang: Language::Chinese,
             target_lang: Language::English,
             is_translating: false,
-            api_key: config.api_key,   // ← 从配置文件恢复
+            api_key,
             translation_rx: Some(rx),
             translation_tx: tx,
             show_settings: false,
             api_key_visible: false,
             _tray_icon: tray_icon,
             show_window: true,
-            // 默认位置：屏幕右下角附近，适合 1080p 及以上分辨率
-            window_pos: egui::pos2(1400.0, 600.0),
             is_pinned: true,
+            #[cfg(windows)]
+            hwnd: None,
+            fixed_pos,
             app_rx,
             quit_id,
         }
@@ -203,6 +424,48 @@ impl TranslateApp {
             ctx_clone.request_repaint();
         });
     }
+
+    /// 获取并缓存 HWND
+    #[cfg(windows)]
+    fn ensure_hwnd(&mut self, ctx: &egui::Context) {
+        if self.hwnd.is_some() {
+            return;
+        }
+        // 检查窗口是否已创建
+        let has_rect = ctx.input(|i| i.viewport().inner_rect.is_some());
+        if !has_rect {
+            return;
+        }
+        // 使用 FindWindowW 通过窗口标题查找
+        let title: Vec<u16> = "Translate Dock\0".encode_utf16().collect();
+        let hwnd = unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::FindWindowW(
+                std::ptr::null(),
+                title.as_ptr(),
+            )
+        };
+        if !hwnd.is_null() {
+            self.hwnd = Some(hwnd);
+        }
+    }
+
+    #[cfg(windows)]
+    fn do_hide(&mut self) {
+        self.show_window = false;
+        if let Some(hwnd) = self.hwnd {
+            hide_window(hwnd);
+        }
+    }
+
+    #[cfg(windows)]
+    fn do_show(&mut self, ctx: &egui::Context) {
+        self.show_window = true;
+        // 先恢复到固定位置
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(self.fixed_pos));
+        if let Some(hwnd) = self.hwnd {
+            show_window(hwnd);
+        }
+    }
 }
 
 impl eframe::App for TranslateApp {
@@ -213,31 +476,24 @@ impl eframe::App for TranslateApp {
 
     // 应用退出时保存配置（兜底，正常情况下 changed() 已实时保存）
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        save_config(&AppConfig { api_key: self.api_key.clone() });
+        save_config_key(&self.api_key);
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 追踪窗口当前位置，以便「隐藏」后能复原
-        // 仅在窗口可见时更新，避免保存到屏幕外的坐标
-        if self.show_window {
-            if let Some(outer_rect) = ctx.input(|i| i.viewport().outer_rect) {
-                // 只有在合理范围内才更新（排除移出屏幕外时的位置）
-                if outer_rect.min.x > -5000.0 {
-                    self.window_pos = outer_rect.min;
-                }
-            }
-        }
+        // 获取窗口句柄（仅第一帧执行）
+        #[cfg(windows)]
+        self.ensure_hwnd(ctx);
 
-        // 处理失去焦点：非固定时移出屏幕外
+        // 处理失去焦点：非固定时隐藏窗口
         if !self.is_pinned && self.show_window {
             let lost_focus = ctx.input(|i| i.events.iter().any(|e| {
                 matches!(e, egui::Event::WindowFocused(false))
             }));
             if lost_focus {
-                self.show_window = false;
-                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
-                    egui::pos2(-32000.0, -32000.0)
-                ));
+                #[cfg(windows)]
+                self.do_hide();
+                #[cfg(not(windows))]
+                { self.show_window = false; }
             }
         }
 
@@ -252,18 +508,17 @@ impl eframe::App for TranslateApp {
                     } = tray_event
                     {
                         if self.show_window {
-                            // 当前可见 → 移出屏幕外
-                            self.show_window = false;
-                            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
-                                egui::pos2(-32000.0, -32000.0)
-                            ));
+                            // 当前可见 → 隐藏
+                            #[cfg(windows)]
+                            self.do_hide();
+                            #[cfg(not(windows))]
+                            { self.show_window = false; }
                         } else {
-                            // 当前隐藏 → 移回屏幕
-                            self.show_window = true;
-                            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
-                                self.window_pos
-                            ));
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                            // 当前隐藏 → 显示
+                            #[cfg(windows)]
+                            self.do_show(ctx);
+                            #[cfg(not(windows))]
+                            { self.show_window = true; }
                         }
                     }
                 }
@@ -287,9 +542,6 @@ impl eframe::App for TranslateApp {
         }
 
         // 主 UI 布局
-        // 修复底部直角问题：CentralPanel 默认会填满整个窗口，如果内部内容没有撑满，
-        // 底部可能会显示为直角。我们需要确保 Frame 的圆角应用到整个面板，
-        // 并且添加 outer_margin 给阴影留出空间，防止阴影和圆角被窗口边缘裁剪。
         let frame = egui::Frame::new()
             .corner_radius(egui::CornerRadius::same(16))
             .inner_margin(16.0)
@@ -336,9 +588,9 @@ impl eframe::App for TranslateApp {
                         if !self.api_key_visible {
                             edit = edit.password(true);
                         }
-                        // 当 api_key 内容变化时立即持久化
+                        // 当 api_key 内容变化时立即持久化（加密存储）
                         if ui.add(edit).changed() {
-                            save_config(&AppConfig { api_key: self.api_key.clone() });
+                            save_config_key(&self.api_key);
                         }
 
                         let eye_icon = if self.api_key_visible { "👁" } else { "" };
@@ -356,10 +608,6 @@ impl eframe::App for TranslateApp {
             }
 
             // ── 可滚动主体区域 ─────────────────────────────────────────────────
-            // 注意：TextEdit 不直接嵌套在 ScrollArea 内——带滚动偏移的 TextEdit 会使
-            // egui 上报给 Windows IME 的候选窗口坐标偏移，导致有文字时中文标点无法输入。
-            // 正确做法：TextEdit 使用 desired_rows + 自身 auto-grow，外层 ScrollArea
-            // 只负责在内容超出窗口时提供整体滚动。
             let scroll_height = ui.available_height() - 44.0;
             egui::ScrollArea::vertical()
                 .id_salt("main_scroll")
@@ -377,10 +625,6 @@ impl eframe::App for TranslateApp {
                     });
 
                     // ── 输入框 ──
-                    // 使用 changed() + ends_with('\n') 检测 Enter：
-                    // • 用户按 Enter → TextEdit 向文本末尾追加 '\n'，changed() = true
-                    // • IME 输入标点/汉字 → 追加的不是 '\n'，ends_with('\n') = false
-                    // 两者可以可靠区分，无需关心 Enter 键事件
                     let input_resp = ui.add(
                         egui::TextEdit::multiline(&mut self.input_text)
                             .desired_width(ui.available_width())
