@@ -6,13 +6,12 @@ use tray_icon::menu::{Menu, MenuItem, MenuEvent, MenuId};
 
 #[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    ShowWindow, SetForegroundWindow, GetSystemMetrics,
-    SW_MINIMIZE, SW_RESTORE,
+    GetSystemMetrics,
     SM_CXSCREEN, SM_CYSCREEN,
     SPI_GETWORKAREA, SystemParametersInfoW,
 };
 #[cfg(windows)]
-use windows_sys::Win32::Foundation::{HWND, RECT};
+use windows_sys::Win32::Foundation::RECT;
 
 // ── 配置持久化 ──────────────────────────────────────────────
 
@@ -235,18 +234,8 @@ pub fn calculate_initial_position(window_width: f32, window_height: f32) -> egui
 
 // ── Win32 窗口操作 ─────────────────────────────────────────
 
-#[cfg(windows)]
-fn hide_window(hwnd: HWND) {
-    unsafe { ShowWindow(hwnd, SW_MINIMIZE); }
-}
+// Win32 API 辅助代码仅保留用于工作区计算，窗口隐藏/显示使用 egui::ViewportCommand
 
-#[cfg(windows)]
-fn show_window(hwnd: HWND) {
-    unsafe {
-        ShowWindow(hwnd, SW_RESTORE);
-        SetForegroundWindow(hwnd);
-    }
-}
 
 // ── 应用事件 ───────────────────────────────────────────────
 
@@ -272,9 +261,6 @@ pub struct TranslateApp {
     /// 逻辑上是否「可见」
     show_window: bool,
     is_pinned: bool,
-    /// 缓存的窗口句柄
-    #[cfg(windows)]
-    hwnd: Option<HWND>,
     /// 固定的窗口位置（每次显示都恢复到此位置）
     fixed_pos: egui::Pos2,
 
@@ -396,8 +382,6 @@ impl TranslateApp {
             _tray_icon: tray_icon,
             show_window: true,
             is_pinned: true,
-            #[cfg(windows)]
-            hwnd: None,
             fixed_pos,
             app_rx,
             quit_id,
@@ -425,46 +409,17 @@ impl TranslateApp {
         });
     }
 
-    /// 获取并缓存 HWND
-    #[cfg(windows)]
-    fn ensure_hwnd(&mut self, ctx: &egui::Context) {
-        if self.hwnd.is_some() {
-            return;
-        }
-        // 检查窗口是否已创建
-        let has_rect = ctx.input(|i| i.viewport().inner_rect.is_some());
-        if !has_rect {
-            return;
-        }
-        // 使用 FindWindowW 通过窗口标题查找
-        let title: Vec<u16> = "Translate Dock\0".encode_utf16().collect();
-        let hwnd = unsafe {
-            windows_sys::Win32::UI::WindowsAndMessaging::FindWindowW(
-                std::ptr::null(),
-                title.as_ptr(),
-            )
-        };
-        if !hwnd.is_null() {
-            self.hwnd = Some(hwnd);
-        }
-    }
-
-    #[cfg(windows)]
-    fn do_hide(&mut self) {
+    fn do_hide(&mut self, ctx: &egui::Context) {
         self.show_window = false;
-        if let Some(hwnd) = self.hwnd {
-            hide_window(hwnd);
-        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
     }
 
-    #[cfg(windows)]
     fn do_show(&mut self, ctx: &egui::Context) {
         self.show_window = true;
         // 先恢复到固定位置
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(self.fixed_pos));
-        if let Some(hwnd) = self.hwnd {
-            show_window(hwnd);
-        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     }
 }
 
@@ -480,9 +435,13 @@ impl eframe::App for TranslateApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 获取窗口句柄（仅第一帧执行）
-        #[cfg(windows)]
-        self.ensure_hwnd(ctx);
+        // 同步窗口状态：如果在原生系统（如点击任务栏）激活了窗口，更新内部状态
+        let gained_focus = ctx.input(|i| i.events.iter().any(|e| {
+            matches!(e, egui::Event::WindowFocused(true))
+        }));
+        if gained_focus {
+            self.show_window = true;
+        }
 
         // 处理失去焦点：非固定时隐藏窗口
         if !self.is_pinned && self.show_window {
@@ -490,10 +449,7 @@ impl eframe::App for TranslateApp {
                 matches!(e, egui::Event::WindowFocused(false))
             }));
             if lost_focus {
-                #[cfg(windows)]
-                self.do_hide();
-                #[cfg(not(windows))]
-                { self.show_window = false; }
+                self.do_hide(ctx);
             }
         }
 
@@ -509,16 +465,10 @@ impl eframe::App for TranslateApp {
                     {
                         if self.show_window {
                             // 当前可见 → 隐藏
-                            #[cfg(windows)]
-                            self.do_hide();
-                            #[cfg(not(windows))]
-                            { self.show_window = false; }
+                            self.do_hide(ctx);
                         } else {
                             // 当前隐藏 → 显示
-                            #[cfg(windows)]
                             self.do_show(ctx);
-                            #[cfg(not(windows))]
-                            { self.show_window = true; }
                         }
                     }
                 }
